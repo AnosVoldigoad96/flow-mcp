@@ -419,14 +419,36 @@ const ASSET_PREFIX = "asset:";
 
 // Waits for THIS upload by its own name until Flow has finished processing it (its picture carries a media id), so
 // a half-processed upload can never be taken for the next generation's result.
-async function waitForUpload(page: Page, name: string, timeoutMs: number): Promise<void> {
+const RIGHTS_WAIT_MS = 5 * 60_000;
+const RIGHTS_CANCELLED = ` If you pressed Cancel on Flow's "Rights to use this image", nothing was uploaded.`;
+
+// An upload can stop on Flow's "Rights to use this image" dialog (Cancel / I agree; seen on a new account's first upload,
+// 2026-10-20). The user asked for it to be accepted automatically, so the driver clicks I agree; should that click not
+// land, it waits for them to answer in the Flow window. Either way the upload then gets its full time again.
+// Polls `done`; false means the time ran out.
+async function waitThroughRights(page: Page, done: () => Promise<boolean>, timeoutMs: number, job?: Job): Promise<boolean> {
+  const rights = page.getByRole("dialog", { name: "Rights to use this image" });
+  let deadline = Date.now() + timeoutMs;
+  while (!(await done())) {
+    if (await rights.isVisible().catch(() => false)) {
+      if (job) job.progress = 'accepting "Rights to use this image"';
+      await rights.getByRole("button", { name: "I agree", exact: true }).click({ timeout: 5000 }).catch(() => {});
+      const answered = await rights.waitFor({ state: "hidden", timeout: RIGHTS_WAIT_MS }).then(() => true, () => false);
+      if (!answered) throw new Error(`Flow's "Rights to use this image" dialog stayed open after clicking I agree. Answer it in the Flow window, then try again.`);
+      if (job) job.progress = undefined;
+      deadline = Date.now() + timeoutMs;
+    }
+    if (Date.now() > deadline) return false;
+    await pause(page, 1000);
+  }
+  return true;
+}
+
+async function waitForUpload(page: Page, name: string, timeoutMs: number, job?: Job): Promise<void> {
   const tile = page.locator(`flow-grid-tile-container[aria-label="${name.replace(/"/g, '\\"')}"]:has([data-media-id])`);
-  await tile
-    .first()
-    .waitFor({ state: "attached", timeout: timeoutMs })
-    .catch(() => {
-      throw new Error(`Flow did not finish processing the upload "${name}" within ${Math.round(timeoutMs / 1000)}s.`);
-    });
+  if (!(await waitThroughRights(page, async () => (await tile.count().catch(() => 0)) > 0, timeoutMs, job))) {
+    throw new Error(`Flow did not finish processing the upload "${name}" within ${Math.round(timeoutMs / 1000)}s.${RIGHTS_CANCELLED}`);
+  }
   await pause(page, 1000);
 }
 
@@ -443,7 +465,7 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   const chooser = page.waitForEvent("filechooser", { timeout: 10_000 });
   await page.getByRole("menuitem", { name: "Upload", exact: true }).click();
   await (await chooser).setFiles(staged);
-  await waitForUpload(page, name, 90_000);
+  await waitForUpload(page, name, 90_000, job);
   return name;
 }
 
@@ -797,6 +819,10 @@ async function ensureProjectGrid(page: Page): Promise<void> {
     await page.goto(inEnglish(root), { waitUntil: "domcontentloaded" });
     await pause(page, 2500);
   }
+  // A new project opens with the agent's session panel showing, which hides the composer and its Agent button, plus a
+  // first-run tip over the composer (2026-10-20: a character build in a fresh project timed out waiting for Agent).
+  await closeSessionPanel(page);
+  await dismissTips(page);
   await showAllMedia(page, true);
   await pause(page, 800);
   await scrollToTop(page);
@@ -810,8 +836,8 @@ export async function runGeneration(job: Job): Promise<string[]> {
   const s = job.params;
 
   await ensureProjectGrid(page);
-  const agent = page.getByRole("button", { name: "Agent", exact: true });
-  if ((await agent.getAttribute("aria-pressed")) === "true") await agent.click();
+  // A new project starts with Agent on; setAgentMode confirms it really went off rather than trusting the click.
+  await setAgentMode(page, false);
   const clear = page.getByRole("button", { name: "Clear prompt" });
   if (await clear.isVisible().catch(() => false)) await clear.click();
 
@@ -1155,6 +1181,7 @@ export interface CharacterParams {
   name: string;
   image?: string;
   describe?: string;
+  look?: string;
   aspect_ratio?: string;
   personality?: string;
   voice?: string;
@@ -1245,7 +1272,9 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
     await page.getByRole("button", { name: "Upload", exact: true }).click();
     await (await chooser).setFiles(image);
   }
-  await page.waitForURL(/\/character\/[0-9a-f-]{36}/, { timeout: 90_000 });
+  if (!(await waitThroughRights(page, async () => /\/character\/[0-9a-f-]{36}/.test(page.url()), 90_000, job))) {
+    throw new Error(`Flow did not open the new character's page within 90 s.${RIGHTS_CANCELLED}`);
+  }
   const url = page.url();
 
   const name = page.getByRole("textbox", { name: "Character name" });
@@ -1278,7 +1307,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
   const clear = page.getByRole("button", { name: "Clear prompt" });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   await showAllMedia(page);
-  if (c.describe) rememberCharacter(c.name, c.describe);
+  if (c.look ?? c.describe) rememberCharacter(c.name, (c.look ?? c.describe)!);
   return { name: c.name, url, portrait };
 }
 
@@ -1392,13 +1421,27 @@ async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAs
   }
 }
 
-// "Reuse prompt" on an agent-made tile opens the agent's session panel, which hides the normal composer.
-async function closeAgentSession(page: Page): Promise<void> {
+// The agent's session panel ("Untitled session") hides the normal composer. "Reuse prompt" on an agent-made tile opens
+// it, and a new project starts with it open. Closing it leaves Agent mode as it was.
+async function closeSessionPanel(page: Page): Promise<void> {
   const panel = page.getByRole("button", { name: "Start new session" });
   if (await panel.isVisible().catch(() => false)) {
     await page.getByRole("button", { name: "Close", exact: true }).click();
     await pause(page, 1000);
   }
+}
+
+// Flow's first-run tips ("You're generating with Gemini Omni Flash…" with Got it) sit over the composer.
+async function dismissTips(page: Page): Promise<void> {
+  const tip = page.getByRole("button", { name: "Got it, dismiss onboarding message" });
+  for (let i = 0; i < 3 && (await tip.first().isVisible().catch(() => false)); i++) {
+    await tip.first().click({ timeout: 5000 }).catch(() => {});
+    await pause(page, 600);
+  }
+}
+
+async function closeAgentSession(page: Page): Promise<void> {
+  await closeSessionPanel(page);
   const clear = page.getByRole("button", { name: "Clear prompt" });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   else {

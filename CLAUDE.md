@@ -700,3 +700,37 @@ The preview tool could not read the project while it lived in ~/Desktop; check t
   `end_hold` {seconds, fade} holds the last frame and fades the picture to black (music_curve fades the sound with it). Checked on The Last Delivery: 103.75 s, -14.4 LUFS.
   The speech check hears "deliveries stopped" as "delivery stopped" on both Tyra and Kokoro: it is the listener, not the voice. Pass the real words as `text` to burnCaptions.
 
+- NEW PROJECT DEFAULTS (seen 2026-10-20, fresh empty project, Windows): the agent session panel ("Untitled session",
+  `Start new session`, `Close`, suggestion chips) is OPEN on load, so the normal composer and its `Agent` button are
+  hidden and the panel's composer shows only `Agent instructions`. Closing the panel reveals the normal composer with
+  `Agent` already PRESSED, plus a first-run tip over it (button `Got it, dismiss onboarding message`). A free character
+  build failed with "Timeout waiting for getByRole('button', { name: 'Agent' })". ensureProjectGrid now closes the panel
+  (closeSessionPanel) and dismisses the tip (dismissTips), and runGeneration switches Agent off via setAgentMode
+  (verified) instead of a blind click.
+- MCP process now exits when stdin closes, once the queue is idle (2026-10-20). Before, the Studio HTTP server kept it
+  alive, so each reconnect left the old process owning :8787 with its old env. Studio reloads itself on a 401 (stale token).
+- TAB LOCK (2026-10-20): LocalCore.exclusive() lets one thing drive the Flow tab at a time: queue jobs, character
+  build/edit/list, assets, download, trash, and the detailed status readout (it opens the account panel). Before this,
+  the Studio panel's calls on load (detailed status, cast list) ran in the middle of a character build. The account panel
+  was left open and its backdrop blocked `Start generation` ("cdk-overlay-transparent-backdrop ... intercepts pointer
+  events"). A detailed status is downgraded to plain while something else holds the tab.
+- RIGHTS DIALOG (2026-10-20, first upload on this account): after a file upload Flow can show dialog `Rights to use this
+  image` ("Make sure you have the necessary rights to any content or files that you upload…", buttons `Cancel` /
+  `I agree`). The character build sat behind it until `waitForURL` timed out at 90 s. At the user's request the driver
+  clicks I agree itself: waitThroughRights (used by waitForUpload and createCharacter) accepts it, falls back to waiting 5 min for the
+  user to answer in the Flow window, then restarts the upload's own timeout.
+- OMNI FIRST-FRAME RE-STAGING (2026-10-20, 9:16 720p, paid): first_frame clips with 2-3 people and "slow push-in" /
+  "slow pull-back" re-blocked the shot after frame 1. People swapped sides, a face drifted to a different woman, and
+  props vanished. Redoing them with technique `static` plus explicit LEFT/CENTRE/RIGHT blocking ("nobody changes
+  places") held the composition for the whole clip (12 + 10 credits). The tip is in playbook.ts continuity.
+- flow_assemble TRANSITIONS (2026-10-20): `transition` (cut | crossfade | dissolve | fadeblack | fadewhite | slideleft |
+  slideup | smoothleft | circleopen | zoomin | pixelize | radial) + `transition_duration` (0.2-2 s, default 0.6) use xfade +
+  acrossfade. Clips are first cut to whole frames, because a 6.016 s clip with 6.0 s of frames would push an xfade offset
+  past its end. Verified: 4 clips (8/8/8/6 s), crossfade 0.6 s -> 28.2 s, A/V within a frame, dialogue onsets shifted
+  by exactly the overlap. The Studio panel has no transition picker yet.
+- UPDATED TO GITHUB 1d17b7b (2026-11-15), keeping the 2026-10-20 local work above (uncommitted). Conflicts resolved:
+  transitions now ride on the new assemble pipeline - whole-frame lengths only when a transition is set, one joinClips()
+  used by the plain, inserts and watermark paths (concat for cuts, an xfade/acrossfade chain otherwise), and filmLength
+  (overlaps subtracted) feeds end_hold's fade and the returned duration. flow_character `look`: GitHub's (with `image`)
+  and the local one (overrides `describe`) are one rule now: look ?? describe is saved, neither drops the old one.
+  createProject joined the tab lock (exclusive).

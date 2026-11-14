@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
-import { assemble, voiceTrack } from "./assemble.js";
+import { assemble, TRANSITIONS, voiceTrack } from "./assemble.js";
 import { GEMINI_VOICES, geminiKey, saveGeminiKey, speakWithGemini } from "./gemini.js";
 import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithKokoro } from "./kokoro.js";
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
@@ -234,6 +234,13 @@ export const shapes = {
       .optional()
       .describe("Paint out the sparkle mark Google's video models put in the bottom-right corner, found automatically and filled from the pixels around it (no crop). The invisible SynthID mark stays, and platforms still expect an AI-content label."),
     watermark_margin: z.number().min(0).max(40).optional().describe("With remove_watermark: grow the mask by this many pixels and make it a diamond. Use about 10 after a long Extend chain, where the mark has been redrawn thicker. Look at the corner afterwards."),
+    transition: z
+      .enum(TRANSITIONS)
+      .default("cut")
+      .describe(
+        "How clips join. 'cut' is a straight cut. 'crossfade' blends one shot into the next (reads as a morph when the clips share a set); 'fadeblack'/'fadewhite' dip through a colour; the rest are wipes and effects. Sound crossfades with the picture.",
+      ),
+    transition_duration: z.number().min(0.2).max(2).default(0.6).describe("Seconds each transition overlaps the two clips; the film gets that much shorter per join."),
   },
   transcribe: {
     video: z.string().min(1).describe("Absolute path of a video or audio file on this computer."),
@@ -400,9 +407,12 @@ export const shapes = {
     aspect_ratio: z.enum(["3:4", "1:1", "9:16", "16:9", "4:3"]).optional().describe("Frame for the drawn portrait when using `describe`. Default 3:4."),
     look: z
       .string()
-      .max(1200)
+      .min(1)
+      .max(1500)
       .optional()
-      .describe("With `image`: the person in the picture in words (face, hair, clothes). Every scene's character lock quotes it word for word, so describe only what the picture shows. Without it, an older description saved under the same name is dropped."),
+      .describe(
+        "The description every scene's character lock quotes word for word. With `image`: the person in the picture in words (face, hair, clothes), only what the picture shows; without it, an older description saved under the same name is dropped. With `describe` (the default look): pass it when `describe` carries portrait-only framing (a plain backdrop, 'full body, centred', 'no other objects') that must not leak into every scene.",
+      ),
     personality: z.string().max(500).optional().describe("How the character acts; Flow uses it when crafting scenes."),
     voice: z.string().optional().describe("Flow voice name, e.g. 'Charon' (male, informative) or 'Aoede' (female, breezy)."),
   },
@@ -479,7 +489,19 @@ export const VOICES = [
 const BUSY = "A generation is running in the Flow tab. Wait for it to finish (flow_wait), then retry.";
 
 export class LocalCore implements Core {
-  private queue: JobQueue = new JobQueue(async (job) => {
+  // One thing drives the Flow tab at a time. Character builds, lists, downloads and trash run outside the queue, and the
+  // panel's own calls on load (detailed status opens the account panel, the cast list opens Characters) landed in the
+  // middle of a character build: the account panel was left over Start generation and the build failed (2026-10-20).
+  private tab: Promise<unknown> = Promise.resolve();
+  private driving = 0;
+  private exclusive<T>(work: () => Promise<T>): Promise<T> {
+    this.driving++;
+    const run = this.tab.then(work);
+    this.tab = run.catch(() => {});
+    return run.finally(() => this.driving--);
+  }
+
+  private queue: JobQueue = new JobQueue((job) => this.exclusive(async () => {
     const { chain_from, reference_from } = job.params;
     if (reference_from) {
       const still = this.queue.get(reference_from)?.files.find((f) => /\.(jpe?g|png|webp)$/i.test(f));
@@ -504,10 +526,17 @@ export class LocalCore implements Core {
     if (job.params.agent_scenes) return runAgentBatch(job);
     if (job.params.edit_asset) return runEdit(job);
     return runGeneration(job);
-  });
+  }));
+
+  // Nothing queued or running, so the process can exit without abandoning a generation that may already be paid for.
+  get idle(): boolean {
+    return !this.queue.list().some((j) => j.status === "queued" || j.status === "running");
+  }
 
   async status({ detailed }: Args<"status">) {
-    const flow = await getFlowState(detailed && !this.queue.busy);
+    // The plan/credits readout opens the account panel, so it holds the tab like any other step, and is skipped rather
+    // than waited for when something else is already driving it.
+    const flow = detailed && !this.queue.busy && !this.driving ? await this.exclusive(() => getFlowState(true)) : await getFlowState(false);
     return { flow, pacing: this.queue.pausedReason, output_root: OUTPUT_ROOT, jobs: this.queue.list().map(jobView) };
   }
 
@@ -621,11 +650,15 @@ export class LocalCore implements Core {
 
   async assets({ kind }: Args<"assets">) {
     if (this.queue.busy) throw new Error(BUSY);
-    return (await listAssets()).filter((a) => !kind || a.kind === kind).map(({ name, kind }) => ({ name, kind }));
+    return (await this.exclusive(() => listAssets())).filter((a) => !kind || a.kind === kind).map(({ name, kind }) => ({ name, kind }));
   }
 
-  async download({ project, assets, quality }: Args<"download">) {
+  async download(args: Args<"download">) {
     if (this.queue.busy) throw new Error(BUSY);
+    return this.exclusive(() => this.downloadNow(args));
+  }
+
+  private async downloadNow({ project, assets, quality }: Args<"download">) {
     const dir = projectDir(project);
     mkdirSync(dir, { recursive: true });
     const files: string[] = [];
@@ -720,7 +753,7 @@ export class LocalCore implements Core {
     // while Flow carries on and charges for it. Re-running then spends twice, which is exactly what happened on
     // 2026-09-20. Flow's own grid is the only honest record, so ask it before starting another paid generation.
     if (!force) {
-      const recent = (await listAssets()).slice(0, 6).filter((a) => a.kind === "video");
+      const recent = (await this.exclusive(() => listAssets())).slice(0, 6).filter((a) => a.kind === "video");
       const source = from_asset.toLowerCase();
       const echo = recent.find((a) => {
         const n = a.name.toLowerCase();
@@ -762,31 +795,32 @@ export class LocalCore implements Core {
 
   async trash({ name }: Args<"trash">) {
     if (this.queue.busy) throw new Error(BUSY);
-    return trashAsset(name);
+    return this.exclusive(() => trashAsset(name));
   }
 
   async new_project({ title }: Args<"new_project">) {
     if (this.queue.busy) throw new Error(BUSY);
-    const made = await createProject(title);
+    const made = await this.exclusive(() => createProject(title));
     return { ...made, note: "The Flow window now has this empty project open; every generation goes into it. Characters belong to a project, so make them again here." };
   }
 
   async character(a: Args<"character">) {
     if (this.queue.busy) throw new Error(BUSY);
     if (!a.image && !a.describe) throw new Error("Pass either `describe` (Flow draws the portrait) or `image`.");
-    const made = await createCharacter(a);
-    // Every scene quotes the saved description in its character lock, so a character made from a picture must not
-    // inherit an older description saved under the same name: it described someone else (a "Maya" with a ponytail and
-    // a mustard sweater, when the new picture showed loose hair and a grey tee).
-    if (a.describe) rememberCharacter(a.name, a.describe);
-    else if (a.look) rememberCharacter(a.name, a.look);
+    const made = await this.exclusive(() => createCharacter(a));
+    // Every scene quotes the saved description in its character lock. `look` wins over `describe`, so portrait-only
+    // framing ("plain grey background") stays out of it; and a character made from a picture must not inherit an older
+    // description saved under the same name: it described someone else (a "Maya" with a ponytail and a mustard sweater,
+    // when the new picture showed loose hair and a grey tee).
+    const look = a.look ?? a.describe;
+    if (look) rememberCharacter(a.name, look);
     else forgetCharacter(a.name);
     return { ...made, use_as: `asset:${a.name}` };
   }
 
   async character_edit({ name, change, look }: Args<"character_edit">) {
     if (this.queue.busy) throw new Error(BUSY);
-    const out = await editCharacter(name, change);
+    const out = await this.exclusive(() => editCharacter(name, change));
     // Every scene that references the character quotes this description in its character lock, so it has to describe
     // the NEW look - "deep navy coat" left in it would argue with a portrait whose coat is now red.
     if (look) rememberCharacter(name, look);
@@ -796,7 +830,7 @@ export class LocalCore implements Core {
 
   async characters() {
     if (this.queue.busy) throw new Error(BUSY);
-    return (await listCharacters()).map((name) => ({ name, use_as: `asset:${name}` }));
+    return (await this.exclusive(() => listCharacters())).map((name) => ({ name, use_as: `asset:${name}` }));
   }
 
   // Panel only: deliberately NOT registered as an MCP tool, so a key typed into Flow Studio never reaches Claude.

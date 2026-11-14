@@ -52,5 +52,6 @@ export const PLAYBOOK = {
     "chain_previous: true starts a scene on the last frame of the scene before it, giving one continuous take across clips.",
     "first_frame + last_frame makes Flow animate between two stills; generate both stills as free images first for controlled transitions.",
     "reference_images (max 3) keep a product or person consistent without fixing the first frame.",
+    "A first_frame clip with two or more people and a camera move (push-in, pull-back) can re-stage the shot: people swap sides and faces drift. Use technique 'static' and state who stays where (LEFT/CENTRE/RIGHT, nobody changes places).",
   ],
 };

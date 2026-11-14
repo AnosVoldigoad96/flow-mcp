@@ -11,6 +11,10 @@ const run = promisify(execFile);
 const FFMPEG = process.env.FLOW_MCP_FFMPEG ?? "ffmpeg";
 const FFPROBE = process.env.FLOW_MCP_FFPROBE ?? "ffprobe";
 
+// Joins between clips. "crossfade" is ffmpeg's xfade "fade"; the others are xfade transitions by their own names.
+export const TRANSITIONS = ["cut", "crossfade", "dissolve", "fadeblack", "fadewhite", "slideleft", "slideup", "smoothleft", "circleopen", "zoomin", "pixelize", "radial"] as const;
+export type Transition = (typeof TRANSITIONS)[number];
+
 export interface AssembleOptions {
   dir: string;
   clips?: string[];
@@ -40,6 +44,8 @@ export interface AssembleOptions {
   // Hold the last frame this long at the end, fading to black over its last `fade` seconds.
   end_hold?: { seconds: number; fade?: number };
   size?: string;
+  transition?: Transition;
+  transition_duration?: number;
 }
 
 interface ClipInfo {
@@ -342,7 +348,7 @@ function musicCurve(points?: { at: number; volume: number }[]): string {
 }
 
 // Joins the scene clips into one film, keeping their own sound and laying music / voiceover on top.
-export async function assemble(o: AssembleOptions): Promise<{ output: string; clips: string[]; duration: number; held_last_frame: number; loudness?: number }> {
+export async function assemble(o: AssembleOptions): Promise<{ output: string; clips: string[]; duration: number; held_last_frame: number; loudness?: number; transition?: string }> {
   // Clips can now come from anywhere, so the project folder the film is saved into may not exist yet.
   if (o.clips?.length) mkdirSync(o.dir, { recursive: true });
   const out = join(o.dir, o.output_name.replace(/[^\w.-]+/g, "_").replace(/(\.mp4)?$/, ".mp4"));
@@ -438,18 +444,27 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
   // The clips' own sound used to play at full volume no matter what, drowning a narration laid on top. Music already
   // had its own level; the clips now do too.
   const clipVolume = Math.min(1, Math.max(0, o.clip_volume ?? 1));
+  // A transition overlaps neighbouring clips, and xfade offsets are measured from each clip's length. Clips report
+  // lengths like 6.016 s for 6.0 s of frames, which would put an offset past the end of a clip, so with a transition
+  // every clip is cut to a whole number of frames (picture padded first, sound padded then trimmed) to keep sync exact.
+  const fade = o.transition && o.transition !== "cut" && clips.length > 1 ? o.transition : undefined;
+  const lengths = infos.map((info) => (fade ? Math.floor(info.duration * 24) / 24 : info.duration));
+  const overlap = fade ? Number(Math.min(o.transition_duration ?? 0.6, ...lengths.map((l) => l / 2)).toFixed(3)) : 0;
+  const filmLength = lengths.reduce((sum, l) => sum + l, 0) - overlap * (clips.length - 1);
   const edges = (i: number) => {
     const { fadeIn, fadeOut } = windows[i];
     return (fadeIn > 0 ? `,afade=t=in:d=${fadeIn.toFixed(3)}` : "") +
-      (fadeOut > 0 ? `,afade=t=out:st=${Math.max(0, infos[i].duration - fadeOut).toFixed(3)}:d=${fadeOut.toFixed(3)}` : "");
+      (fadeOut > 0 ? `,afade=t=out:st=${Math.max(0, lengths[i] - fadeOut).toFixed(3)}:d=${fadeOut.toFixed(3)}` : "");
   };
   const blurs = await Promise.all(
     clips.map((clip, i) => (i > 0 && windows[i].soften > 0 ? matchSoftness(clips[i - 1], windows[i - 1].to, clip, windows[i].from) : Promise.resolve(0))),
   );
   infos.forEach((info, i) => {
-    const freeze = hold > 0.05 && i === infos.length - 1 ? `,tpad=stop_mode=clone:stop_duration=${hold.toFixed(2)}` : "";
+    const last = i === infos.length - 1;
+    const exact = fade ? `,tpad=stop_mode=clone:stop_duration=0.2,trim=duration=${lengths[i].toFixed(3)},setpts=PTS-STARTPTS` : "";
+    const freeze = hold > 0.05 && last ? `,tpad=stop_mode=clone:stop_duration=${hold.toFixed(2)}` : "";
     const base = `[${i}:v]${windows[i].crop}scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,setpts=PTS-STARTPTS${Math.abs(windows[i].saturation - 1) > 0.005 ? `,hue=s=${windows[i].saturation.toFixed(3)}` : ""}`;
-    const end = `${freeze}[v${i}]`;
+    const end = `${exact}${freeze}[v${i}]`;
     if (blurs[i] > 0) {
       // Blurred copy on top, fading out over soften seconds: the clip opens as soft as the one before ends.
       const d = windows[i].soften.toFixed(2);
@@ -461,10 +476,14 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
     } else {
       filters.push(`${base}${end}`);
     }
+    const soundLength = lengths[i] + (last ? hold : 0);
+    const soundTail = fade
+      ? `,apad,atrim=duration=${soundLength.toFixed(3)},asetpts=PTS-STARTPTS`
+      : hold > 0.05 && last ? `,apad=pad_dur=${hold.toFixed(2)}` : "";
     filters.push(
       info.hasAudio
-        ? `[${i}:a]atrim=end=${info.duration.toFixed(3)},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,volume=${(clipVolume * windows[i].volume).toFixed(3)}${edges(i)}${hold > 0.05 && i === infos.length - 1 ? `,apad=pad_dur=${hold.toFixed(2)}` : ""}[a${i}]`
-        : `anullsrc=r=48000:cl=stereo,atrim=duration=${(info.duration + (i === infos.length - 1 ? hold : 0)).toFixed(2)}[a${i}]`,
+        ? `[${i}:a]atrim=end=${info.duration.toFixed(3)},asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,volume=${(clipVolume * windows[i].volume).toFixed(3)}${edges(i)}${soundTail}[a${i}]`
+        : `anullsrc=r=48000:cl=stereo,atrim=duration=${soundLength.toFixed(fade ? 3 : 2)}[a${i}]`,
     );
   });
   let input = clips.length;
@@ -489,6 +508,27 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
     }
     input++;
   });
+  // Straight cuts concatenate the clips; a transition chains xfade (picture) and acrossfade (sound) instead, each join
+  // overlapping the two clips by `overlap` seconds.
+  const joinClips = (picture: string) => {
+    if (!fade) {
+      filters.push(`${infos.map((_, i) => `${vOut[i]}${aOut[i]}`).join("")}concat=n=${clips.length}:v=1:a=1[${picture}][clipaudio]`);
+      return;
+    }
+    const type = fade === "crossfade" ? "fade" : fade;
+    let v = vOut[0];
+    let a = aOut[0];
+    let length = lengths[0];
+    for (let i = 1; i < clips.length; i++) {
+      const last = i === clips.length - 1;
+      const vNext = last ? `[${picture}]` : `[vx${i}]`;
+      const aNext = last ? "[clipaudio]" : `[ax${i}]`;
+      filters.push(`${v}${vOut[i]}xfade=transition=${type}:duration=${overlap}:offset=${(length - overlap).toFixed(3)}${vNext}`);
+      filters.push(`${a}${aOut[i]}acrossfade=d=${overlap}:c1=tri:c2=tri${aNext}`);
+      [v, a] = [vNext, aNext];
+      length += lengths[i] - overlap;
+    }
+  };
   let watermarkNote: string | undefined;
   let markDir = "";
   let markBox: { cx: number; cy: number; r: number } | null = null;
@@ -503,20 +543,20 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
     });
     markBox = await watermarkMask(samples, width, height, mask, o.watermark_margin ?? 0);
     if (markBox) {
-      filters.push(`${infos.map((_, i) => `${vOut[i]}${aOut[i]}`).join("")}concat=n=${clips.length}:v=1:a=1[vraw][clipaudio]`);
+      joinClips("vraw");
       filters.push(`[vraw]removelogo=filename=${mask.replace(/[\\:']/g, "\\$&")}[v]`);
       watermarkNote = "watermark painted out";
     } else {
-      filters.push(`${infos.map((_, i) => `${vOut[i]}${aOut[i]}`).join("")}concat=n=${clips.length}:v=1:a=1[v][clipaudio]`);
+      joinClips("v");
       watermarkNote = "no corner watermark found; nothing painted out";
     }
   } else {
-    filters.push(`${infos.map((_, i) => `${vOut[i]}${aOut[i]}`).join("")}concat=n=${clips.length}:v=1:a=1[v][clipaudio]`);
+    joinClips("v");
   }
 
   let picture = "[v]";
   if (o.end_hold?.fade) {
-    const total = infos.reduce((sum, i) => sum + i.duration, 0) + hold;
+    const total = filmLength + hold;
     filters.push(`[v]fade=t=out:st=${(total - o.end_hold.fade).toFixed(3)}:d=${o.end_hold.fade.toFixed(3)}[vfade]`);
     picture = "[vfade]";
   }
@@ -606,9 +646,10 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
     }
   }
   return {
-    output, clips, duration: infos.reduce((sum, i) => sum + i.duration, 0) + hold, held_last_frame: Number(hold.toFixed(2)),
+    output, clips, duration: Number((filmLength + hold).toFixed(3)), held_last_frame: Number(hold.toFixed(2)),
     ...(lufs !== undefined ? { loudness: Number(lufs.toFixed(1)) } : {}),
     ...(watermarkNote ? { watermark: watermarkNote } : {}),
+    ...(fade ? { transition: `${fade}, ${overlap} s per join` } : {}),
   };
 }
 

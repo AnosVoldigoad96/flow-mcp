@@ -439,8 +439,15 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const LIVE = location.protocol.startsWith("http") && TOKEN !== "__FLOW_" + "TOKEN__";
+// Every server start issues a new token, so a tab opened before a restart is refused on every call and sat on "Server
+// offline" for good. Reload to pick up the new token (at most every 10 s, in case something else is refusing it).
+const reloadForToken = () => {
+  try { if (Date.now() - Number(sessionStorage.getItem("flow-reload") || 0) < 10000) return; sessionStorage.setItem("flow-reload", String(Date.now())); } catch {}
+  location.reload();
+};
 const api = async (method, body = {}) => {
   const res = await fetch(`/api/${method}`, { method: "POST", headers: { "content-type": "application/json", "x-flow-token": TOKEN }, body: JSON.stringify(body) });
+  if (res.status === 401) reloadForToken();
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || res.statusText);
   return data;

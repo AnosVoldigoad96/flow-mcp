@@ -299,7 +299,7 @@ server.registerTool(
   {
     title: "Assemble clips into one video",
     description:
-      "Join a project's downloaded scene clips in order into one MP4 (local ffmpeg, no credits). Keeps each clip's own sound and can lay a music track and a voiceover on top.",
+      "Join a project's downloaded scene clips in order into one MP4 (local ffmpeg, no credits), with straight cuts or a transition (crossfade, dip to black, wipes...). Keeps each clip's own sound and can lay a music track and a voiceover on top.",
     inputSchema: shapes.assemble,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -343,3 +343,16 @@ server.registerTool(
 );
 
 await server.connect(new StdioServerTransport());
+
+// The Studio server keeps the event loop alive, so after the app disconnected (reconnect, restart) the old process
+// lived on holding the port with its old settings, and the new one became a client forwarding to it (2026-10-20). Exit
+// when stdin closes, but only once the queue is idle: killing a job mid-generation can lose a shot already paid for.
+let exiting = false;
+const exitWhenIdle = () => {
+  if (exiting) return;
+  exiting = true;
+  const check = () => (local.idle ? process.exit(0) : setTimeout(check, 5000));
+  check();
+};
+process.stdin.on("end", exitWhenIdle);
+process.stdin.on("close", exitWhenIdle);
