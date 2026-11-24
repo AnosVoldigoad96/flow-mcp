@@ -456,13 +456,15 @@ const media = (path) => `/media?token=${TOKEN}&path=${encodeURIComponent(path)}`
 const toast = (msg, bad) => { const t = Object.assign(document.createElement("div"), { className: "toast" + (bad ? " bad" : ""), textContent: msg }); document.body.append(t); setTimeout(() => t.remove(), bad ? 7000 : 3200); };
 const guard = () => { if (!LIVE) { toast("Not connected — start Flow Studio first.", true); return false; } return true; };
 
-// Prices Flow quotes on a Pro plan, x1 take.
-const VIDEO_COST = { "Omni 1.1 Flash": { "360p": { 4: 4, 6: 5, 8: 6, 10: 7 }, "720p": { 4: 7, 6: 10, 8: 12, 10: 15 } }, "Veo 3.1 - Lite": 10, "Veo 3.1 - Fast": 20, "Veo 3.1 - Quality": 100 };
+// Prices Flow quotes on a Pro plan, x1 take. Omni 1.2 Flash (read from Flow 2026-11-15) has a 3-15 s Length slider:
+// 3 credits a second at 720p up to 10 s, then 6; 1 a second at 360p up to 10 s, then 2.
+const omni12 = (perSec) => Object.fromEntries([4, 6, 8, 10, 12, 15].map((s) => [s, s <= 10 ? s * perSec : 10 * perSec + (s - 10) * perSec * 2]));
+const VIDEO_COST = { "Omni 1.2 Flash": { "360p": omni12(1), "720p": omni12(3) }, "Omni 1.1 Flash": { "360p": { 4: 4, 6: 5, 8: 6, 10: 7 }, "720p": { 4: 7, 6: 10, 8: 12, 10: 15 } }, "Veo 3.1 - Lite": 10, "Veo 3.1 - Fast": 20, "Veo 3.1 - Quality": 100 };
 const blank = () => ({ prompt: "", technique: "", chain: false, match: false, first: null, last: null, refs: [] });
 const DEFAULTS = {
   tab: "cast",
   frames: { project: "MyFilm", aspect: "16:9", variants: 1, engine: "exact", scenes: [blank()] },
-  shots: { project: "MyFilm", model: "Omni 1.1 Flash", aspect: "16:9", duration: 8, resolution: "720p", variants: 1, quality: "original", max: 25, scenes: [blank()] },
+  shots: { project: "MyFilm", model: "Omni 1.2 Flash", aspect: "16:9", duration: 8, resolution: "720p", variants: 1, quality: "original", max: 25, scenes: [blank()] },
   narrate: { project: "MyFilm", engine: "kokoro", kokoroVoice: "am_michael", speed: 100, geminiVoice: "Charon", text: "", style: "" },
   cut: { project: "MyFilm", music: null, voiceover: null, hold: true, clips: [] },
   captions: { video: null, style: "bold", position: "bottom", size: 100, colors: {}, text: "" },
@@ -492,12 +494,15 @@ const hashTab = () => { const t = location.hash.slice(1); return $(`#tabs button
 addEventListener("hashchange", () => { const t = hashTab(); if (t) showTab(t); });
 
 /* ---------- segmented controls ---------- */
+// Lengths each Omni model offers (Veo is fixed at 8 s). A saved length the chosen model lacks falls back to 8 s.
+const lengthsFor = (model) => Object.keys(VIDEO_COST[model]?.["720p"] ?? { 8: 0 }).map(Number);
+const fitLength = () => { if (!lengthsFor(S.shots.model).includes(S.shots.duration)) S.shots.duration = 8; };
 const SEGS = {
   f_aspect: { get: () => S.frames.aspect, set: (v) => (S.frames.aspect = v), opts: ["16:9", "9:16", "1:1", "4:3", "3:4"] },
   f_variants: { get: () => S.frames.variants, set: (v) => (S.frames.variants = +v), opts: [1, 2, 3, 4] },
   f_engine: { get: () => S.frames.engine, set: (v) => (S.frames.engine = v), opts: ["exact", "agent"], labels: { exact: "One by one", agent: "Flow agent · all at once" } },
   s_aspect: { get: () => S.shots.aspect, set: (v) => (S.shots.aspect = v), opts: ["16:9", "9:16"] },
-  s_duration: { get: () => S.shots.duration, set: (v) => (S.shots.duration = +v), opts: [4, 6, 8, 10] },
+  s_duration: { get: () => S.shots.duration, set: (v) => (S.shots.duration = +v), opts: () => lengthsFor(S.shots.model) },
   s_resolution: { get: () => S.shots.resolution, set: (v) => (S.shots.resolution = v), opts: ["360p", "720p"] },
   s_quality: { get: () => S.shots.quality, set: (v) => (S.shots.quality = v), opts: ["original", "upscaled"], labels: { original: "720p", upscaled: "1080p" } },
   s_variants: { get: () => S.shots.variants, set: (v) => (S.shots.variants = +v), opts: [1, 2, 3, 4] },
@@ -510,7 +515,8 @@ function renderSegs() {
     const host = $(`[data-seg="${key}"]`); if (!host) continue;
     const omni = S.shots.model.startsWith("Omni");
     const off = (key === "s_duration" || key === "s_resolution") && !omni;
-    host.innerHTML = cfg.opts.map((o) => `<button type="button" data-v="${o}" class="${String(cfg.get()) === String(o) ? "on" : ""}" ${off ? "disabled" : ""}>${cfg.labels?.[o] ?? o}</button>`).join("");
+    const opts = typeof cfg.opts === "function" ? cfg.opts() : cfg.opts;
+    host.innerHTML = opts.map((o) => `<button type="button" data-v="${o}" class="${String(cfg.get()) === String(o) ? "on" : ""}" ${off ? "disabled" : ""}>${cfg.labels?.[o] ?? o}</button>`).join("");
   }
 }
 document.addEventListener("click", (e) => {
@@ -1193,7 +1199,11 @@ async function poll(detailed = false) {
 /* ---------- boot ---------- */
 function renderAll() {
   for (const [id, val] of [["f_project", S.frames.project], ["s_project", S.shots.project], ["n_project", S.narrate.project], ["c_project", S.cut.project], ["e_project", S.cut.project], ["l_project", S.cut.project]]) if ($("#" + id) && !$("#" + id).value) $("#" + id).value = val;
-  $("#s_model").innerHTML = Object.keys(VIDEO_COST).map((m) => `<option ${m === S.shots.model ? "selected" : ""}>${m}</option>`).join("");
+  // Flow's model menu marks these "Leaving Dec 5" (2026-11-15); the label says so, the value stays Flow's own name.
+  const leaving = new Set(["Omni 1.1 Flash", "Veo 3.1 - Fast", "Veo 3.1 - Quality"]);
+  if (!VIDEO_COST[S.shots.model]) S.shots.model = "Omni 1.2 Flash";
+  fitLength();
+  $("#s_model").innerHTML = Object.keys(VIDEO_COST).map((m) => `<option value="${m}" ${m === S.shots.model ? "selected" : ""}>${m}${leaving.has(m) ? " · leaving Dec 5" : ""}</option>`).join("");
   renderSegs(); renderScenes(); renderCast(); renderNarrate();
   const mus = $('[data-slot="music"]'), vo = $('[data-slot="voiceover"]');
   if (mus) mus.outerHTML = slotHtml("music", 0, S.cut.music, "Music track");
@@ -1203,7 +1213,7 @@ function renderAll() {
   if ($("#n_style")) $("#n_style").value = S.narrate.style ?? "";
   estimate(); save();
 }
-$("#s_model").addEventListener("change", (e) => { S.shots.model = e.target.value; save(); renderAll(); });
+$("#s_model").addEventListener("change", (e) => { S.shots.model = e.target.value; fitLength(); save(); renderAll(); });
 for (const [id, path] of [["f_project", "frames"], ["s_project", "shots"], ["n_project", "narrate"], ["c_project", "cut"]])
   $("#" + id).addEventListener("input", (e) => { S[path].project = e.target.value; save(); });
 (async () => {

@@ -101,7 +101,7 @@ server.registerTool(
   {
     title: "Queue Flow generations",
     description:
-      "Queue one clip or image per scene in the open Flow project. Runs one at a time with human-like pauses and spends the user's Google AI credits (approx. per video: Omni 1.1 Flash 7-12, Veo 3.1 Lite 10, Fast 20, Quality 100; images 0). Each scene is checked against max_credits using Flow's own quote before anything is spent. Returns job ids immediately; use flow_wait for results.",
+      "Queue one clip or image per scene in the open Flow project. Runs one at a time with human-like pauses and spends the user's Google AI credits (approx. per video: Omni 1.2 Flash 3 a second at 720p up to 10 s, then 6; Omni 1.1 Flash 7-15; Veo 3.1 Lite 10, Fast 20, Quality 100; images 0). Each scene is checked against max_credits using Flow's own quote before anything is spent. Returns job ids immediately; use flow_wait for results.",
     inputSchema: shapes.generate,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
@@ -246,6 +246,17 @@ server.registerTool(
     annotations: { openWorldHint: true },
   },
   (args) => reply(patient("flow_new_project", core.new_project(args))),
+);
+
+server.registerTool(
+  "flow_open_project",
+  {
+    title: "Open an existing Flow project",
+    description: "Open one of the user's existing Google Flow projects in the Flow window, by its address or id, so new generations go into it. Free. Use it when flow_status says no project is open but the user already has one (e.g. after the Flow window restarted).",
+    inputSchema: shapes.open_project,
+    annotations: { openWorldHint: true },
+  },
+  (args) => reply(patient("flow_open_project", core.open_project(args))),
 );
 
 server.registerTool(

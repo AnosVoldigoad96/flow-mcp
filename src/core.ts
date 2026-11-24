@@ -8,7 +8,7 @@ import { KOKORO_DEFAULT_VOICE, KOKORO_MB, KOKORO_VOICES, kokoroReady, speakWithK
 import { extractFirstFrame, extractFrameAt, extractLastFrame } from "./chain.js";
 import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { presenter } from "./presenter.js";
-import { characterLook, createCharacter, createProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
+import { characterLook, createCharacter, createProject, openProject, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, forgetCharacter, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
 import { BIN, COMPUTER, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
@@ -24,9 +24,15 @@ const sceneSchema = z.object({
   model: z
     .string()
     .optional()
-    .describe("Model label as shown in Flow, e.g. 'Omni 1.1 Flash', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality', 'Nano Banana Pro'. Images default to the newest Nano Banana (2.1 today); video omitted keeps Flow's current model."),
+    .describe("Model label as shown in Flow, e.g. 'Omni 1.2 Flash', 'Omni 1.1 Flash', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality', 'Nano Banana Pro'. Images default to the newest Nano Banana (2.1 today); video omitted keeps Flow's current model."),
   aspect_ratio: z.enum(["16:9", "9:16", "1:1", "4:3", "3:4"]).optional().describe("Video supports 16:9 and 9:16 only."),
-  duration: z.union([z.literal(4), z.literal(6), z.literal(8), z.literal(10)]).optional().describe("Video length in seconds. Omni models only; Veo 3.1 clips are fixed at 8s."),
+  duration: z
+    .number()
+    .int()
+    .min(3)
+    .max(15)
+    .optional()
+    .describe("Video length in seconds. Omni 1.2 Flash: any whole number from 3 to 15. Omni 1.1 Flash: 4, 6, 8 or 10 only. Veo 3.1 clips are fixed at 8s."),
   resolution: z.enum(["360p", "720p"]).optional().describe("Video resolution. Omni models only."),
   max_credits: z.number().int().min(0).default(25).describe("Safety cap: the scene is skipped (nothing spent) if Flow quotes more credits than this."),
   variants: z.number().int().min(1).max(4).optional().describe("Outputs per prompt (each one spends credits). Default 1."),
@@ -392,6 +398,9 @@ export const shapes = {
   new_project: {
     title: z.string().max(80).optional().describe("Name for the new project, e.g. 'Desk lamp UGC ad'. Default: Flow's own date-and-time name."),
   },
+  open_project: {
+    project: z.string().min(1).max(300).describe("The project's address (https://flow.google.com/project/<id>) or just its id."),
+  },
   character: {
     name: z.string().min(1).max(60).describe("Character name; scenes then reference it as 'asset:<name>' in reference_images."),
     describe: z
@@ -450,6 +459,7 @@ export interface Core {
   voices(): Promise<unknown>;
   narrate(a: Args<"narrate">): Promise<unknown>;
   new_project(a: Args<"new_project">): Promise<unknown>;
+  open_project(a: Args<"open_project">): Promise<unknown>;
   character(a: Args<"character">): Promise<unknown>;
   characters(): Promise<unknown>;
   character_edit(a: Args<"character_edit">): Promise<unknown>;
@@ -802,6 +812,12 @@ export class LocalCore implements Core {
     if (this.queue.busy) throw new Error(BUSY);
     const made = await this.exclusive(() => createProject(title));
     return { ...made, note: "The Flow window now has this empty project open; every generation goes into it. Characters belong to a project, so make them again here." };
+  }
+
+  async open_project({ project }: Args<"open_project">) {
+    if (this.queue.busy) throw new Error(BUSY);
+    const opened = await this.exclusive(() => openProject(project));
+    return { ...opened, note: "The Flow window now has this project open; every generation goes into it." };
   }
 
   async character(a: Args<"character">) {

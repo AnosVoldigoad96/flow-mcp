@@ -734,3 +734,37 @@ The preview tool could not read the project while it lived in ~/Desktop; check t
   (overlaps subtracted) feeds end_hold's fade and the returned duration. flow_character `look`: GitHub's (with `image`)
   and the local one (overrides `describe`) are one rule now: look ?? describe is saved, neither drops the old one.
   createProject joined the tab lock (exclusive).
+- AGENT BATCH THREW AWAY ITS OWN IMAGES (2026-11-15, 12-still batch for a ghazal film): the agent drew all 12, then
+  matching died on the first tile with "locator.click: Timeout ... getByRole('button', { name: 'Reuse prompt' })".
+  agentRound still used `el.hover()`, which never reveals a tile's toolbar (the same trap hoverTile exists for), and the
+  throw sent all 12 scenes to the one-by-one route (about 20 min instead of 2). storedPrompt() now moves the pointer off
+  and onto the tile (hoverTile), waits for Reuse prompt, tries twice, and returns "" instead of throwing, so one stubborn
+  tile only leaves its own scene unmatched. Verified live: 2 scenes -> "2 of 2 scenes came from the agent", each matched
+  to its own scene, about 2 min.
+- OPEN AN EXISTING PROJECT (2026-11-15): `flow_open_project` / core.open_project takes a project address or id and
+  loads /project/<id> (hl=en), waits for the project's name box, and refuses when Flow ends up elsewhere. Needed
+  because on Windows, stopping a Studio that the app's preview tool started (preview_stop) killed the Flow Chrome it had
+  launched too, despite spawn({ detached: true }) - the preview tool ends the whole process tree - and the new Chrome
+  came back on the home page with the project closed. So: never restart that Studio while a job runs, and reopen the
+  project afterwards. Verified live (reopened the user's project, characters intact; a bad id is refused in words). The
+  MCP tool shows up only after Claude restarts; until then, POST /api/open_project with the token reaches it.
+- OMNI 1.2 FLASH (mapped live 2026-11-15, Pro plan). Flow's video menu: "Omni 1.2 Flash", "Omni 1.1 Flash Leaving Dec 5",
+  "Veo 3.1 - Lite", "Veo 3.1 - Fast Leaving Dec 5", "Veo 3.1 - Quality Leaving Dec 5". Omni 1.2 has NO duration
+  radios: its settings popover has `slider "Length"` (<input type=range matsliderthumb>, min 0, max 12, step 1 = 3-15 s)
+  with the text "Length <N> Sec" beside it. pickDuration focuses it, presses Home, then ArrowRight until the label shows
+  the asked length (the quote updates as it moves), and falls back to the 4s/6s/8s/10s radios when there is no slider
+  (Omni 1.1). Quotes, x1: 720p 3 credits a second up to 10 s (6 s 18, 10 s 30), then 6 a second (11 s 36 ... 15 s 60);
+  360p 1 a second up to 10 s, then 2 (15 s 20). Double Omni 1.1 at 720p 10 s (15). `duration` now takes any whole
+  3-15. Verified: two max_credits=0 jobs quoted exactly 18 (6 s) and 30 (10 s), nothing generated. The Studio offers
+  4/6/8/10/12/15 for Omni 1.2, labels the leaving models, and defaults new panels to Omni 1.2.
+- SPEECH MODEL DOWNLOAD ON A FLAKY NETWORK (2026-11-15, Windows): huggingface's CDN reset the connection again and again
+  ("curl: (56) Recv failure: Connection was reset", once schannel SEC_E_DECRYPT_FAILURE), anywhere from 14 KB to 50 MB
+  in. The old fetchModel tried twice and deleted the .part. It now resumes (-C -) over HTTP/1.1 and keeps going while
+  tries make progress (gives up after 4 tries in a row that add nothing, or 60 in all), keeping the .part for next
+  time. The 148 MB base.en model took 17 resumed tries by hand on this line; it is installed in ~/.flow-mcp/models.
+- LOUDNESS NO LONGER SQUASHES MUSIC (2026-11-15, Aaye Kuch Abr, a music-only film): flow_assemble's `loudness` ran
+  loudnorm inside the mix in its one-pass dynamic mode, which rides the gain: the score's solo sarangi opening went
+  from -46 dB to -18 dB, nearly as loud as the full ensemble (-14). The mix is now left alone and the finished film is
+  levelled only by the existing measure -> plain gain -> alimiter (limit 0.84) step. Checked: the film tracks the
+  score at a constant +3.2 dB from the quiet opening to the fade, -14.3 LUFS, LRA 15.8 LU, sample peak -0.9 dBFS.
+  Talking films now get the same plain gain: if a quiet take ever needs a lot of gain, watch the limiter.

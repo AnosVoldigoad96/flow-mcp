@@ -340,6 +340,29 @@ async function pickRadio(page: Page, name: string | RegExp): Promise<void> {
   }
 }
 
+// Omni 1.2 Flash sets its length with a slider, not radios (mapped live 2026-11-15): an <input type=range> named
+// "Length", positions 0-12 for 3-15 s, with the chosen length written beside it as "Length <N> Sec". Omni 1.1 Flash
+// kept its 4s/6s/8s/10s radios. The slider is moved with the keyboard (Home, then ArrowRight), which Angular Material
+// takes like a drag and which updates the credit quote, and the seconds are read back from the label, not assumed.
+async function pickDuration(page: Page, seconds: number): Promise<void> {
+  const slider = page.getByRole("slider", { name: "Length" });
+  if (!(await slider.isVisible().catch(() => false))) await openSettings(page).catch(() => undefined);
+  if (!(await slider.isVisible().catch(() => false))) return pickRadio(page, `${seconds}s`);
+  const pane = page.locator(".cdk-overlay-pane:has(.credit-cost-label)").first();
+  const shown = async () => Number((await pane.innerText().catch(() => "")).match(/Length\s*(\d+)\s*Sec/i)?.[1] ?? NaN);
+  await slider.focus();
+  await page.keyboard.press("Home");
+  await pause(page, 300);
+  const steps = Number(await slider.getAttribute("max")) || 12;
+  for (let i = 0; i < steps && (await shown()) < seconds; i++) {
+    await page.keyboard.press("ArrowRight");
+    await pause(page, 250);
+  }
+  const got = await shown();
+  await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur?.());
+  if (got !== seconds) throw new Error(`This model's Length slider cannot be set to ${seconds} s (it stopped at ${got} s). Nothing was generated.`);
+}
+
 // Image jobs use the newest Nano Banana unless another model is named (the user's call, 2026-10-13: "should always
 // default to latest"). The menu then held Nano Banana Pro, 2 Lite and 2.1 - the plain "Nano Banana 2" was gone, and
 // asking for it by name picked whichever came first. The newest is the highest version number that is not a Lite model,
@@ -404,7 +427,7 @@ async function applySettings(page: Page, job: Job): Promise<number> {
   const model = s.type === "image" && LEGACY_IMAGE_MODEL.test(s.model ?? "") ? LATEST_IMAGE_MODEL : s.model;
   if (model) await pickModel(page, model);
   if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}`));
-  if (s.type === "video" && s.duration) await pickRadio(page, `${s.duration}s`);
+  if (s.type === "video" && s.duration) await pickDuration(page, s.duration);
   await pickRadio(page, `x${s.variants ?? 1}`);
   await pause(page, 600);
   // The quote is "<N> credits". Low balances add an "Add AI credits" banner link that the old /credits?$/ also matched.
@@ -1502,6 +1525,26 @@ function step(job: Job, text: string | undefined): void {
   console.error(`[flow-mcp ${job.id}] ${((Date.now() - t0s.get(job)!) / 1000).toFixed(1)}s ${text}`);
 }
 
+// The prompt Flow stored for a tile: its toolbar's "Reuse prompt" puts it in the composer. The toolbar only shows for
+// a real pointer move, so this goes through hoverTile, never locator.hover(). Returns "" when the prompt cannot be
+// read: that scene is then asked for again, instead of one tile failing the whole batch (2026-11-15: el.hover() never
+// revealed the toolbar, the click timed out, and 12 finished agent images were thrown away and redrawn one by one).
+async function storedPrompt(page: Page, id: string): Promise<string> {
+  await scanGrid(page, (seen) => seen.some((x) => x.id === id));
+  const tile = mediaTile(page, id);
+  const reuse = tile.getByRole("button", { name: "Reuse prompt" });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.mouse.move(2, 2); // off the tile first, so the move onto it is a genuine one
+    await hoverTile(page, tile, 250);
+    if (await reuse.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
+      await reuse.click({ timeout: 5000 });
+      await pause(page, 900);
+      return await page.locator(".ProseMirror").first().innerText();
+    }
+  }
+  return "";
+}
+
 async function agentRound(
   page: Page,
   job: Job,
@@ -1595,13 +1638,7 @@ async function agentRound(
   const prompts: string[] = [];
   for (const [k, tile] of fresh.entries()) {
     step(job, `matching image ${k + 1} of ${fresh.length} to its scene`);
-    await scanGrid(page, (seen) => seen.some((x) => x.id === tile.id));
-    const el = mediaTile(page, tile.id!);
-    await el.scrollIntoViewIfNeeded();
-    await el.hover();
-    await el.getByRole("button", { name: "Reuse prompt" }).click();
-    await pause(page, 900);
-    prompts.push(await page.locator(".ProseMirror").first().innerText());
+    prompts.push(await storedPrompt(page, tile.id!).catch(() => ""));
   }
   await closeAgentSession(page);
 
@@ -1878,6 +1915,23 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
 
   if (balance !== undefined && left !== undefined) job.credits = balance - left;
   return files;
+}
+
+// Opens an existing project by its address or id, so work can go back into it without anyone clicking: after the Flow
+// window was restarted it comes back on the home page (2026-11-15, Windows: stopping the Studio through the app's
+// preview tool took the Chrome it had launched down with it, and the open project was lost).
+export async function openProject(project: string): Promise<{ id: string; url: string; title: string }> {
+  const id = project.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0]?.toLowerCase();
+  if (!id) throw new Error(`"${project}" is not a Flow project address or id: it should contain the project's id, like 497a6167-5cc1-4c8a-a2e4-08cc06f6ede9.`);
+  const page = await getFlowPage();
+  const url = `https://flow.google.com/project/${id}`;
+  await page.goto(inEnglish(url), { waitUntil: "domcontentloaded" });
+  const name = page.getByRole("textbox", { name: "Editable text" }).first();
+  await name.waitFor({ state: "visible", timeout: 30_000 }).catch(() => undefined);
+  if (!page.url().includes(`/project/${id}`)) {
+    throw new Error(`Flow did not open project ${id} (it went to ${page.url()}). Check the id, and that this Google account owns the project.`);
+  }
+  return { id, url, title: await name.inputValue().catch(() => "") };
 }
 
 // A fresh Flow project, so a film can start from scratch without anyone clicking. Mapped live (2026-10-30): Flow's home

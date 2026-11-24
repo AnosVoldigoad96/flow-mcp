@@ -205,11 +205,32 @@ function fetchModel(kind: SpeechModel): Promise<string> {
     // Claude's connector. curl ships with macOS and Windows 10+, follows the redirect to the download host, and can
     // only fail itself.
     const part = `${dest}.part`;
-    await run("curl", ["-L", "--fail", "--silent", "--show-error", "--connect-timeout", "20", "--retry", "2", "-o", part, `${process.env.FLOW_MCP_MODEL_BASE || !("base" in SPEECH_MODELS[kind]) ? MODEL_BASE : (SPEECH_MODELS[kind] as { base: string }).base}/${file}`], BIG).catch((err: RunError) => {
-      rmSync(part, { force: true });
-      throw new Error(err.code === "ENOENT" ? "curl is not installed" : String(err.stderr || err.message).trim().split("\n").at(-1));
-    });
-    if (statSync(part).size < mb * 0.9e6) {
+    const url = `${process.env.FLOW_MCP_MODEL_BASE || !("base" in SPEECH_MODELS[kind]) ? MODEL_BASE : (SPEECH_MODELS[kind] as { base: string }).base}/${file}`;
+    // Some networks reset HTTPS connections mid-transfer (2026-11-15, Windows: "curl: (56) Recv failure: Connection was
+    // reset" or schannel SEC_E_DECRYPT_FAILURE, anywhere from 14 KB to 50 MB in, and the old code deleted the .part and
+    // gave up). Each try now resumes from what already arrived (-C -) over HTTP/1.1, and it keeps trying for as long as
+    // tries make progress: it stops after 4 tries in a row that add nothing. The .part is kept for the next call.
+    const enough = () => existsSync(part) && statSync(part).size >= mb * 0.9e6;
+    const size = () => (existsSync(part) ? statSync(part).size : 0);
+    let stalled = 0;
+    for (let attempt = 1; attempt <= 60; attempt++) {
+      const before = size();
+      let why = "";
+      const ok = await run("curl", ["-L", "--fail", "--silent", "--show-error", "--http1.1", "--connect-timeout", "20", "-C", "-", "-o", part, url], BIG).then(
+        () => true,
+        (err: RunError) => {
+          if (err.code === "ENOENT") throw new Error("curl is not installed");
+          why = String(err.stderr || err.message).trim().split("\n").at(-1) ?? "";
+          return false;
+        },
+      );
+      // A complete .part answers a resume with "416 Range Not Satisfiable": that means done, not broken.
+      if (ok || (/\b416\b/.test(why) && enough())) break;
+      stalled = size() > before ? 0 : stalled + 1;
+      if (stalled >= 4 || attempt >= 60) throw new Error(why);
+      await new Promise((r) => setTimeout(r, 1000 + 1000 * stalled));
+    }
+    if (!enough()) {
       rmSync(part, { force: true });
       throw new Error("it arrived incomplete");
     }

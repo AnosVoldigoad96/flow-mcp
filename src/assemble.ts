@@ -581,7 +581,11 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
     }
     mix.push("[vo]");
   }
-  const level = o.loudness !== undefined ? `loudnorm=I=${Math.min(-9, Math.max(-30, o.loudness))}:TP=-1.5:LRA=11,aresample=48000` : "anull";
+  // No loudnorm in the mix itself: in its one-pass (dynamic) mode it rides the gain like an automatic level control and
+  // squeezed a music score's range (2026-11-15, Aaye Kuch Abr: a solo sarangi opening at -46 dB came out at -18 dB,
+  // almost as loud as the full ensemble at -14). The film is levelled afterwards with one plain gain change and a
+  // peak limiter (below), which moves everything by the same amount and keeps quiet passages quiet.
+  const level = "anull";
   filters.push(mix.length > 1 ? `${mix.join("")}amix=inputs=${mix.length}:duration=first:dropout_transition=0:normalize=0,${level}[a]` : `[clipaudio]${level}[a]`);
 
   const output = out;
@@ -628,8 +632,8 @@ export async function assemble(o: AssembleOptions): Promise<{ output: string; cl
       watermarkNote = `watermark painted out, plus ${ghosts.length} brief second cop${ghosts.length === 1 ? "y" : "ies"} at ${ghosts.map((g) => `${g.at.toFixed(1)}-${g.to.toFixed(1)} s`).join(", ")}`;
     }
   }
-  // One loudnorm pass is held back by its true-peak ceiling: Three Tiers asked for -14 and came out at -14.9. Measure
-  // the film and close the gap with plain gain, a limiter keeping the peaks under -1.5 dB.
+  // Levelling: measure the finished film and move it to the target with plain gain, a limiter keeping the peaks under
+  // -1.5 dB. This is the only levelling step now (see `level` above), so a film's own dynamics survive it.
   let lufs: number | undefined;
   if (o.loudness !== undefined) {
     const target = Math.min(-9, Math.max(-30, o.loudness));
